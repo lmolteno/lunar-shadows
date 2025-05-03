@@ -184,50 +184,50 @@ def calculate_lunar_horizon(star_coord, obs_time, dem_data, resolution=360):
                 earth_itrs.earth_location.geodetic.lon,
                 earth_itrs.earth_location.geodetic.lat,
                 height=0 * u.m
-
             )
 
+            projected_ellipsoid_gcrs = projected_ellipsoid.get_itrs(obstime=obs_time).transform_to(GCRS(obstime=obs_time))
+
             # Calculate the ellipsoid normal at this point
-            normal = np.array([projected_ellipsoid.x.value, projected_ellipsoid.y.value, projected_ellipsoid.z.value * (WGS84_SEMIMAJOR_AXIS / WGS84_SEMIMINOR_AXIS) ** 2])
+            normal = projected_ellipsoid_gcrs.cartesian.xyz.value
+            normal = np.array([normal[0], normal[1], normal[2] * (WGS84_SEMIMAJOR_AXIS / WGS84_SEMIMINOR_AXIS) ** 2])
             normal = normal / np.linalg.norm(normal)
 
-            x, y, z = projected_ellipsoid.x.value, projected_ellipsoid.y.value, projected_ellipsoid.z.value
+            x, y, z = projected_ellipsoid_gcrs.cartesian.xyz.value
 
             # Iterative refinement (usually converges in 1-3 iterations)
             for _ in range(10):
                 # Find the point on the ray that intersects the plane defined
                 # by the current point and its normal
-                t = np.dot(np.array([x,y,z]) - earth_itrs.cartesian.xyz.value, normal) / np.dot(direction, normal)
-                intersection = earth_itrs.cartesian.xyz.value + t * direction
+                t = np.dot(np.array([x,y,z]) - earth_gcrs.cartesian.xyz.value, normal) / np.dot(direction, normal)
+                intersection = earth_gcrs.cartesian.xyz.value + t * direction
 
-                # Project this intersection to the ellipsoid
-                new_location = EarthLocation.from_geocentric(
-                    intersection[0] * u.m,
-                    intersection[1] * u.m,
-                    intersection[2] * u.m
-                )
+                new_location = GCRS(CartesianRepresentation(x=intersection[0], y=intersection[1], z=intersection[2], unit=u.m), obstime=obs_time)\
+                    .transform_to(ITRS(obstime=obs_time)) \
+                    .earth_location
 
                 # Get the surface point (height=0)
-                new_location= EarthLocation.from_geodetic(
+                new_location = EarthLocation.from_geodetic(
                     new_location.lon,
                     new_location.lat,
                     height=0 * u.m
                 )
 
+                new_location = new_location.get_itrs(obstime=obs_time).transform_to(GCRS(obstime=obs_time))
+
                 # Check if we've converged
-                x_new, y_new, z_new = new_location.x.value, new_location.y.value, new_location.z.value
-                if np.linalg.norm(np.array([x_new, y_new, z_new]) - np.array([x, y, z])) < 0.1:
-                    # print(f'converged after {i + 1}')
+                x_new, y_new, z_new = new_location.cartesian.xyz.value
+                if np.linalg.norm(np.array([x_new, y_new, z_new]) - np.array([x, y, z])) < 1:
                     break
 
                 # Update for next iteration
-                projected_ellipsoid = new_location
+                projected_ellipsoid_gcrs = new_location
                 x, y, z = x_new, y_new, z_new
                 normal = np.array([x, y, z * (WGS84_SEMIMAJOR_AXIS / WGS84_SEMIMINOR_AXIS) ** 2])
                 normal = normal / np.linalg.norm(normal)
 
             # Convert to EarthLocation (lat, lon, height)
-            earth_location = earth_itrs.earth_location
+            earth_location = projected_ellipsoid_gcrs.transform_to(ITRS(obstime=obs_time)).earth_location
             # print(np.linalg.norm(earth_location.get_itrs().cartesian.xyz - projected_ellipsoid.get_itrs().cartesian.xyz))
 
             if PLOT:
@@ -277,7 +277,7 @@ def calculate_lunar_horizon(star_coord, obs_time, dem_data, resolution=360):
         elevations[i] = elevation
 
     timings_df = pd.DataFrame(timings)
-    print(timings_df.median())
+    print(timings_df.median() / 1e6)
 
     return azimuths, elevations, shadow_locations
 
@@ -360,12 +360,8 @@ def main():
 
     for row in timeseries:
         obs_time = row['time']
-        zone_center, zone_width = find_grazing_zone(star, obs_time)
 
-        print(f"Grazing zone center: {zone_center.lat}, {zone_center.lon}")
-        print(f"Grazing zone width: {zone_width}")
-
-        azimuths, elevations, shadow_points = calculate_lunar_horizon(star, obs_time, dem_data)
+        azimuths, elevations, shadow_points = calculate_lunar_horizon(star, obs_time, dem_data, resolution=360 * 4)
 
         lats = []
         lons = []
