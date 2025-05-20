@@ -1,5 +1,7 @@
-from time import perf_counter_ns
-
+from multiprocessing import shared_memory
+import multiprocessing as mp
+from functools import partial
+from time import perf_counter_ns, sleep
 import matplotlib.pyplot as plt
 import pickle
 from cartopy.crs import WGS84_SEMIMAJOR_AXIS, WGS84_SEMIMINOR_AXIS
@@ -9,16 +11,18 @@ import numpy as np
 import rasterio
 from astropy import units as u
 from astropy.coordinates import SkyCoord, GCRS, ITRS, CartesianRepresentation, EarthLocation
-from astropy.coordinates import get_body, solar_system_ephemeris
-from astropy.table import Table, Column
 from lunarsky import SkyCoord, MoonLocation, Time, MCMF
 from astropy.timeseries import TimeSeries
 import cartopy.crs as ccrs
 from tqdm import tqdm
+import logging
+import multiprocessing_logging
 
 
 MOON_RADIUS=1737.4 * u.km
 PLOT=False
+
+# points_projected = mp.Value('i', 0)
 
 
 def plot_sphere(ax, radius, offset=[0,0,0]):
@@ -27,6 +31,65 @@ def plot_sphere(ax, radius, offset=[0,0,0]):
     y = np.sin(u) * np.sin(v)
     z = np.cos(v)
     ax.plot_wireframe((x * radius) + offset[0], (y * radius) + offset[1], (z * radius) + offset[2], color="r")
+
+
+def optimized_ellipsoid_intersection(earth_itrs, earth_gcrs, direction, obs_time, max_iterations=10, convergence_threshold=1):
+    projected_ellipsoid = EarthLocation.from_geodetic(
+        earth_itrs.earth_location.geodetic.lon,
+        earth_itrs.earth_location.geodetic.lat,
+        height=0 * u.m
+    )
+
+    # Do the initial transform once
+    projected_gcrs = projected_ellipsoid.get_itrs(obstime=obs_time).transform_to(GCRS(obstime=obs_time))
+
+    # Pre-calculate constants
+    earth_position = earth_gcrs.cartesian.xyz.value
+    ellipsoid_factor = (WGS84_SEMIMAJOR_AXIS / WGS84_SEMIMINOR_AXIS) ** 2
+
+    # Current position
+    position = projected_gcrs.cartesian.xyz.value
+
+    # Iterative refinement with early stopping
+    for i in range(max_iterations):
+        # Calculate ellipsoid normal more efficiently
+        normal = np.array([position[0], position[1], position[2] * ellipsoid_factor])
+        normal = normal / np.linalg.norm(normal)
+
+        # Ray-plane intersection
+        numerator = np.dot(position - earth_position, normal)
+        denominator = np.dot(direction, normal)
+        t = numerator / denominator
+
+        # New intersection point
+        intersection = earth_position + t * direction
+
+        # Transform to ITRS only once per iteration
+        new_gcrs = GCRS(CartesianRepresentation(x=intersection[0], y=intersection[1], z=intersection[2], unit=u.m),
+                        obstime=obs_time)
+        new_itrs = new_gcrs.transform_to(ITRS(obstime=obs_time))
+        new_location = new_itrs.earth_location
+
+        # Project to surface
+        new_surface = EarthLocation.from_geodetic(
+            new_location.lon,
+            new_location.lat,
+            height=0 * u.m
+        )
+
+        # Transform back to GCRS
+        new_gcrs = new_surface.get_itrs(obstime=obs_time).transform_to(GCRS(obstime=obs_time))
+        new_position = new_gcrs.cartesian.xyz.value
+
+        # Check convergence
+        if np.linalg.norm(new_position - position) < convergence_threshold:
+            return new_gcrs
+
+        # Update for next iteration
+        position = new_position
+
+    # Return the final position if we didn't converge
+    return GCRS(CartesianRepresentation(x=position[0], y=position[1], z=position[2], unit=u.m), obstime=obs_time)
 
 def sample_vector(dem_data, limb_vecs):
     lon = np.degrees(np.arctan2(limb_vecs[:, 1], limb_vecs[:, 0]))
@@ -46,6 +109,7 @@ def sample_vector(dem_data, limb_vecs):
 
     return elevation
 
+spice_lock = mp.Lock()
 
 def calculate_lunar_horizon(star_coord, obs_time, dem_data, resolution=360):
     """
@@ -70,7 +134,8 @@ def calculate_lunar_horizon(star_coord, obs_time, dem_data, resolution=360):
         Maximum elevations (heights above lunar reference radius) at each azimuth
     """
     # Convert star coordinates to MCMF frame
-    star_mcmf = star_coord.transform_to(MCMF(obstime=obs_time))
+    with spice_lock:
+        star_mcmf = star_coord.transform_to(MCMF(obstime=obs_time))
 
     # Define azimuths around the lunar limb
     azimuths = np.linspace(0, 360, resolution, endpoint=False) * u.deg
@@ -82,7 +147,7 @@ def calculate_lunar_horizon(star_coord, obs_time, dem_data, resolution=360):
     timings = []
 
     # For each azimuth, find the point on the lunar limb
-    for i, az in tqdm([*enumerate(azimuths)]):
+    for i, az in enumerate(azimuths):
         azi_start = perf_counter_ns()
 
         # Calculate the direction from the lunar center toward the star
@@ -121,7 +186,7 @@ def calculate_lunar_horizon(star_coord, obs_time, dem_data, resolution=360):
 
             original_vec_time = perf_counter_ns()
 
-            distances = (np.arange(start=-10, stop=10, step=0.1) * u.km).to(u.m).value.reshape(-1, 1)
+            distances = (np.arange(start=-400, stop=400, step=0.1) * u.km).to(u.m).value.reshape(-1, 1)
             translated_coords = surface_coord.value + (star_vec * distances)
             unit_translated_coord = translated_coords / np.linalg.norm(translated_coords, axis=1).reshape(-1, 1)
             new_elevation = sample_vector(dem_data, unit_translated_coord).reshape(-1, 1)
@@ -138,6 +203,7 @@ def calculate_lunar_horizon(star_coord, obs_time, dem_data, resolution=360):
             max_vec_time = perf_counter_ns()
 
 
+            # with spice_lock:
             surface_coord = SkyCoord(MCMF(surface_coord, obstime=obs_time)).transform_to(GCRS(obstime=obs_time))
             moon_point = surface_coord.cartesian.xyz.value.T[0]
             star_gcrs = star_coord.transform_to(GCRS(obstime=obs_time))
@@ -178,57 +244,16 @@ def calculate_lunar_horizon(star_coord, obs_time, dem_data, resolution=360):
             earth_itrs = earth_gcrs.transform_to(ITRS(obstime=obs_time))
 
             sphere_point_time = perf_counter_ns()
+            if (165 * u.degree < earth_itrs.earth_location.geodetic.lon < 175 * u.degree
+                    and -48 * u.degree < earth_itrs.earth_location.geodetic.lat < -40 * u.degree):
+                ellipsoid_point = optimized_ellipsoid_intersection(earth_itrs, earth_gcrs, direction, obs_time)
+            else:
+                ellipsoid_point = earth_gcrs
 
-            # now iteratively intersect with the ellipsoid
-            projected_ellipsoid = EarthLocation.from_geodetic(
-                earth_itrs.earth_location.geodetic.lon,
-                earth_itrs.earth_location.geodetic.lat,
-                height=0 * u.m
-            )
-
-            projected_ellipsoid_gcrs = projected_ellipsoid.get_itrs(obstime=obs_time).transform_to(GCRS(obstime=obs_time))
-
-            # Calculate the ellipsoid normal at this point
-            normal = projected_ellipsoid_gcrs.cartesian.xyz.value
-            normal = np.array([normal[0], normal[1], normal[2] * (WGS84_SEMIMAJOR_AXIS / WGS84_SEMIMINOR_AXIS) ** 2])
-            normal = normal / np.linalg.norm(normal)
-
-            x, y, z = projected_ellipsoid_gcrs.cartesian.xyz.value
-
-            # Iterative refinement (usually converges in 1-3 iterations)
-            for _ in range(10):
-                # Find the point on the ray that intersects the plane defined
-                # by the current point and its normal
-                t = np.dot(np.array([x,y,z]) - earth_gcrs.cartesian.xyz.value, normal) / np.dot(direction, normal)
-                intersection = earth_gcrs.cartesian.xyz.value + t * direction
-
-                new_location = GCRS(CartesianRepresentation(x=intersection[0], y=intersection[1], z=intersection[2], unit=u.m), obstime=obs_time)\
-                    .transform_to(ITRS(obstime=obs_time)) \
-                    .earth_location
-
-                # Get the surface point (height=0)
-                new_location = EarthLocation.from_geodetic(
-                    new_location.lon,
-                    new_location.lat,
-                    height=0 * u.m
-                )
-
-                new_location = new_location.get_itrs(obstime=obs_time).transform_to(GCRS(obstime=obs_time))
-
-                # Check if we've converged
-                x_new, y_new, z_new = new_location.cartesian.xyz.value
-                if np.linalg.norm(np.array([x_new, y_new, z_new]) - np.array([x, y, z])) < 1:
-                    break
-
-                # Update for next iteration
-                projected_ellipsoid_gcrs = new_location
-                x, y, z = x_new, y_new, z_new
-                normal = np.array([x, y, z * (WGS84_SEMIMAJOR_AXIS / WGS84_SEMIMINOR_AXIS) ** 2])
-                normal = normal / np.linalg.norm(normal)
+            ellipsoid_point_time = perf_counter_ns()
 
             # Convert to EarthLocation (lat, lon, height)
-            earth_location = projected_ellipsoid_gcrs.transform_to(ITRS(obstime=obs_time)).earth_location
-            # print(np.linalg.norm(earth_location.get_itrs().cartesian.xyz - projected_ellipsoid.get_itrs().cartesian.xyz))
+            earth_location = ellipsoid_point.transform_to(ITRS(obstime=obs_time)).earth_location
 
             if PLOT:
                 fig = plt.figure()
@@ -256,19 +281,18 @@ def calculate_lunar_horizon(star_coord, obs_time, dem_data, resolution=360):
                 ax.set_aspect("equal")
                 plt.show()
 
-            ellipsoid_point_time = perf_counter_ns()
-
-            total_azimuth_time = ellipsoid_point_time - azi_start
-            ellipsoid_time = ellipsoid_point_time - sphere_point_time
-            grazing_time = max_vec_time - original_vec_time
-
             shadow_locations.append(earth_location)
-            timings.append({
-                'total_time': total_azimuth_time,
-                'sphere_time': sphere_point_time - max_vec_time,
-                'grazing_time': grazing_time,
-                'ellipsoid_time': ellipsoid_time,
-            })
+
+            # total_azimuth_time = ellipsoid_point_time - azi_start
+            # ellipsoid_time = ellipsoid_point_time - sphere_point_time
+            # grazing_time = max_vec_time - original_vec_time
+            #
+            # timings.append({
+            #     'total_time': total_azimuth_time,
+            #     'sphere_time': sphere_point_time - max_vec_time,
+            #     'grazing_time': grazing_time,
+            #     'ellipsoid_time': ellipsoid_time,
+            # })
 
         else:
             # Without a DEM, assume a spherical moon
@@ -276,108 +300,121 @@ def calculate_lunar_horizon(star_coord, obs_time, dem_data, resolution=360):
 
         elevations[i] = elevation
 
-    timings_df = pd.DataFrame(timings)
-    print(timings_df.median() / 1e6)
+        # with points_projected.get_lock():
+        #     points_projected.value += 1
+
+    # timings_df = pd.DataFrame(timings)
+    # logging.debug(timings_df.mean() / 1e6)
 
     return azimuths, elevations, shadow_locations
 
 
-def find_grazing_zone(star_coord, obs_time, moon_radius=1737.1 * u.km, dem_file=None):
-    """
-    Find the band of altitudes on the lunar surface that need to be considered
-    for grazing occultation calculations.
+def process_time_point(obs_time, star, shm_name, shape, dtype):
+    """Process a time point using DEM data from shared memory."""
+    # Attach to existing shared memory block
+    existing_shm = shared_memory.SharedMemory(name=shm_name)
 
-    Parameters:
-    -----------
-    star_coord : SkyCoord
-        Coordinates of the star in ICRS frame
-    obs_time : Time
-        Observation time
-    moon_radius : Quantity
-        Lunar reference radius
-    dem_file : str, optional
-        Path to lunar DEM TIFF file
+    # Create a NumPy array that references the shared memory
+    dem_data = np.ndarray(shape, dtype=dtype, buffer=existing_shm.buf)
 
-    Returns:
-    --------
-    zone_center : MoonLocation
-        Location on the Moon closest to the grazing zone center
-    zone_width : Quantity
-        Width of the grazing zone in km
-    """
-    # Convert star coordinates to MCMF frame
-    star_mcmf = star_coord.transform_to(MCMF(obstime=obs_time))
+    # Process using the shared data
+    azimuths, elevations, shadow_points = calculate_lunar_horizon(star, obs_time, dem_data, resolution=360 * 60)
 
-    # Get the unit vector pointing from Moon center toward the star
-    star_vec = np.array([star_mcmf.cartesian.x.value[0],
-                         star_mcmf.cartesian.y.value[0],
-                         star_mcmf.cartesian.z.value[0]])
-    star_vec = star_vec / np.linalg.norm(star_vec)
+    lats = []
+    lons = []
 
-    # The grazing zone center is perpendicular to the star direction
-    # We need to find the point on the lunar surface where the star is at the horizon
+    for point in shadow_points:
+        lon, lat, height = point.geodetic
+        lons.append(lon.to(u.deg).value)
+        lats.append(lat.to(u.deg).value)
 
-    # Find a vector that's perpendicular to the star direction
-    if np.abs(star_vec[2]) < 0.9:
-        perp_vec = np.cross(star_vec, np.array([0, 0, 1]))
-    else:
-        perp_vec = np.cross(star_vec, np.array([1, 0, 0]))
-    perp_vec = perp_vec / np.linalg.norm(perp_vec)
+    # Clean up the shared memory attachment (but don't unlink it)
+    existing_shm.close()
 
-    # The center of the grazing zone is approximately in this direction
-    grazing_center_vec = perp_vec * moon_radius.value
+    return obs_time.value, np.array([lons, lats])
 
-    # Convert to MoonLocation
-    zone_center = MoonLocation.from_selenocentric(
-        grazing_center_vec[0] * u.km,
-        grazing_center_vec[1] * u.km,
-        grazing_center_vec[2] * u.km
-    )
+def initialize_shared_memory(dem_file):
+    """Load DEM data and create a shared memory block containing it."""
+    # Load DEM data
+    with rasterio.open(dem_file) as src:
+        dem_data = src.read(1)
 
-    # Estimate the width of the zone (this is approximate and depends on many factors)
-    # For grazing occultations, usually interested in terrain within a few km of the limb
-    zone_width = 10 * u.km  # Adjust based on precision needs and lunar terrain
+    # Get shape and data type information
+    shape = dem_data.shape
+    dtype = dem_data.dtype
 
-    return zone_center, zone_width
+    # Create a shared memory block large enough to contain the array
+    shm = shared_memory.SharedMemory(create=True, size=dem_data.nbytes)
 
+    # Create a NumPy array backed by shared memory
+    shared_array = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
+
+    # Copy data into shared array
+    shared_array[:] = dem_data[:]
+
+    return shm.name, shape, dtype
 
 # Example usage
 def main():
-    star = SkyCoord.from_name('Antares')
     dem_file = "./Lunar_LRO_LOLA_Global_LDEM_118m_Mar2014.tif"
 
-    timeseries = TimeSeries(time_start='2025-08-31T11:22:00Z', time_delta=2 * u.minute, n_samples=30)
+    timeseries = TimeSeries(time_start='2025-08-31T11:20:00Z', time_delta=10 * u.second, n_samples=6 * 60)
+
+    # Create shared memory for DEM data
+    print(f"Reading {dem_file}")
+    shm_name, shape, dtype = initialize_shared_memory(dem_file)
+
+    # Get the time points
+    time_points = [row['time'] for row in timeseries]
+
+    # Get the number of available CPU cores
+    num_cores = 16
+    num_workers = max(1, num_cores - 1)
+    print(f"Starting {num_workers} workers")
 
     out_dict = {}
 
-    ax = plt.axes(projection=ccrs.PlateCarree(central_longitude=170))
-    ax.coastlines()
+    logging.basicConfig(level=logging.DEBUG)
+    multiprocessing_logging.install_mp_handler()
 
-    # Load DEM if provided
-    if dem_file:
-        with rasterio.open(dem_file) as src:
-            dem_data = src.read(1)
+    try:
+        for star_name in ['Antares', 'Antares B']:
+            star = SkyCoord.from_name(star_name)
+            with tqdm(total=len(time_points), desc=f"Processing for {star_name}") as pbar:
+                # Create a pool of worker processes
+                with mp.Pool(processes=num_workers) as pool:
+                    # Create a partial function with the star and shared memory details
+                    process_func = partial(process_time_point,
+                                           star=star,
+                                           shm_name=shm_name,
+                                           shape=shape,
+                                           dtype=dtype)
 
-    for row in timeseries:
-        obs_time = row['time']
+                    # Map the function to all time points
+                    results = pool.imap_unordered(process_func, time_points)
 
-        azimuths, elevations, shadow_points = calculate_lunar_horizon(star, obs_time, dem_data, resolution=360 * 4)
+                    #     prev_points = 0
+                    #     while prev_points < pbar.total:
+                    #         with points_projected.get_lock():
+                    #             change = points_projected.value - prev_points
+                    #             prev_points = points_projected.value
+                    #         pbar.update(change)
+                    #         sleep(0.1)
 
-        lats = []
-        lons = []
+                    # Process results
+                    for time_value, result in results:
+                        out_dict[time_value] = result
+                        pbar.update(1)
 
-        for point in shadow_points:
-            lon, lat, height = point.geodetic
-            lons.append(lon.to(u.deg).value)
-            lats.append(lat.to(u.deg).value)
+            with open(f'{star_name}_edges.pickle', 'wb') as f:
+                pickle.dump(out_dict, f)
+    finally:
+        # Clean up the shared memory
+        shm = shared_memory.SharedMemory(name=shm_name)
+        shm.close()
+        shm.unlink()  # This actually removes the shared memory block
 
-        out_dict[obs_time.value] = np.array([lons, lats])
-
-    plt.show()
-
-    with open('edges.pickle', 'wb') as f:
-        pickle.dump(out_dict, f)
-
+    # Save results
     # Plot results
     # plt.figure(figsize=(10, 6))
     # plt.polar(azimuths.to_value(u.rad), elevations.to_value(u.km) + 1737.1)
@@ -388,18 +425,4 @@ def main():
 
 
 if __name__ == "__main__":
-    from pathlib import Path
-    if Path("edges.pickle").is_file() and False:
-        with open("edges.pickle", "rb") as f:
-            edges = pickle.load(f)
-
-        ax = plt.axes(projection=ccrs.Orthographic(central_longitude=170.5, central_latitude=-43))
-        ax.coastlines()
-        for time, [lons, lats] in edges.items():
-            ax.plot(lons, lats, c='k', alpha=0.3, transform=ccrs.Geodetic())
-
-        # ax.set_global()
-
-        plt.show()
-    else:
-        main()
+    main()
