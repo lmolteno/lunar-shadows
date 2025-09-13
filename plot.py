@@ -40,11 +40,12 @@ ax.add_geometries(roads.geometry, crs=nz_mercator, facecolor='none', edgecolor=r
 # highways
 ax.add_geometries(roads[roads.hway_num.notna()].geometry, crs=nz_mercator, facecolor='none', edgecolor=road_color, alpha=0.5, linewidth=1)
 
-with open("corrected_Antares.pickle", "rb") as f:
+with open("corrected_antares.pickle", "rb") as f:
     antares_edges = pickle.load(f)
 
-with open("corrected_Antares B.pickle", "rb") as f:
+with open("corrected_antares_b.pickle", "rb") as f:
     antares_b_edges = pickle.load(f)
+    print(antares_b_edges)
 
 antares_patch = mpatches.Polygon([[0, 0]], closed=True, fill=True, fc="tab:red", ec='none', alpha=0.7, transform=ccrs.Geodetic())
 antares_b_patch = mpatches.Polygon([[0, 0]], closed=True, fill=True, fc="tab:cyan", ec='none', alpha=0.3, transform=ccrs.Geodetic())
@@ -101,7 +102,8 @@ for time in tqdm(sorted(antares_edges.keys())[100:]):
     antares_b_patch.set_zorder(10)
     plt.title(f"Lunar Occultation of Antares A and B\n$\\mathtt{{{time}Z}}$")
 
-    ax.set_extent([169, 170.5, -43.5, -44.8], crs=ccrs.PlateCarree())
+    #ax.set_extent([169, 170.8, -43.5, -44.8], crs=ccrs.PlateCarree())
+    ax.set_extent([165, 175, -40, -47], crs=ccrs.PlateCarree())
 
     # plt.gcf().canvas.draw()
     # plt.gcf().canvas.flush_events()

@@ -101,8 +101,8 @@ def sample_vector(dem_data, limb_vecs):
     # Look up elevation from DEM at this point
     # Convert lat/lon to pixel coordinates for the DEM
     # px, py = int(256 * (lon + 180)), int(256 * (lat + 90))
-    px = np.array(256 * (lon + 180), dtype=int)
-    py = np.array(256 * (lat + 90), dtype=int)
+    px = np.array((256 * (lon + 180)) - 1, dtype=int)
+    py = np.array((256 * (lat + 90)) - 1, dtype=int)
 
     # Lookup elevation at this point
     elevation = dem_data[py, px] * u.m
@@ -378,8 +378,9 @@ def main():
     multiprocessing_logging.install_mp_handler()
 
     try:
-        for star_name in ['Antares', 'Antares B']:
-            star = SkyCoord.from_name(star_name)
+        antares = ['antares', SkyCoord.from_name('Antares')]
+        antares_b = ['antares_b', antares[1].directional_offset_by(277 * u.deg, 2.8 * u.arcsec)]
+        for star_name, star in [antares_b]:
             with tqdm(total=len(time_points), desc=f"Processing for {star_name}") as pbar:
                 # Create a pool of worker processes
                 with mp.Pool(processes=num_workers) as pool:

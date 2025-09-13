@@ -287,7 +287,7 @@ def main():
 
     out_dict = {}
 
-    crater_df = pd.read_csv('map-data/moon/lunar_crater_database_robbins_2018_bundle/data/big_craters.csv')
+    crater_df = pd.read_csv('map-data/moon/large_craters.csv')
     crater_df = crater_df[crater_df['DIAM_CIRC_IMG'] > 20]
     crater_polygons = generate_polygons(crater_df['LAT_CIRC_IMG'].values * u.deg, crater_df['LON_CIRC_IMG'].values * u.deg, crater_df['DIAM_CIRC_IMG'].values * u.km, 15)
 
@@ -304,7 +304,7 @@ def main():
         terminator_altaz = terminator.transform_to(local_altaz)
 
         antares_a = SkyCoord.from_name('Antares').transform_to(local_altaz)
-        antares_b = SkyCoord.from_name('Antares B').transform_to(local_altaz)
+        antares_b = SkyCoord.from_name('Antares').directional_offset_by(277 * u.deg, 2.8 * u.arcsec).transform_to(local_altaz)
 
         plt.clf()
         plt.gcf().set_size_inches(10, 10)

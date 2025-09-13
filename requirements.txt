@@ -1,0 +1,9 @@
+astropy
+cartopy
+pandas
+rasterio
+lunarsky
+multiprocessing_logging
+geopandas
+tqdm
+scipy

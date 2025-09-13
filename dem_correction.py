@@ -111,8 +111,12 @@ def main():
     dem_dataset = rasterio.open(dem_file)
     dem_data = dem_dataset.read(1)
     try:
-        for file in ["Antares_edges.pickle", "Antares B_edges.pickle"]:
-            star_name = file.split("_")[0]
+        star_coords = {
+                "antares": SkyCoord.from_name("Antares"),
+                "antares_b": SkyCoord.from_name("Antares").directional_offset_by(277 * u.deg, 2.8 * u.arcsec)
+        }
+        for file in ["antares_edges.pickle", "antares_b_edges.pickle"]:
+            star_name = file.split("_edges")[0]
             with open(file, 'rb') as f:
                 edges = pickle.load(f)
 
@@ -121,7 +125,7 @@ def main():
             for time_str in tqdm(sorted(edges.keys())):
                 corrected_points = []
                 obs_time = Time(time_str)
-                star = SkyCoord.from_name(star_name).transform_to(ITRS(obstime=obs_time))
+                star = star_coords[star_name].transform_to(ITRS(obstime=obs_time))
                 star_normed = star.cartesian.xyz / np.linalg.norm(star.cartesian.xyz)
                 coords = edges[time_str].T
                 for lon, lat in tqdm(coords, leave=False):
